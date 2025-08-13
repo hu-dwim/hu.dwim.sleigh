@@ -47,115 +47,43 @@
   (:lambda (x)
     (list :define :name (third x) :value (fifth x))))
 
-(defrule pp/variable-substitution
+(defrule pp/substitution
     (and "$(" ident ")")
   (:lambda (x)
-    ;; TODO
-    nil))
+    (list :substitution (second x))))
 
 (defrule pp/ifdef-stmt
-  (and "@ifdef" ws ident
+  (and (or "@ifdef"
+           "@ifndef")
+       ws ident
        (* pp/statement)
        opt-ws (? (and "@else" (* pp/statement)))
        opt-ws "@endif")
   (:lambda (x)
-    (list* :ifdef :condition (nth 2 x) :body (nth 3 x)
+    (list* (eswitch ((first x) :test 'equal)
+             ("@ifdef"  :ifdef)
+             ("@ifndef" :ifndef))
+           :condition (nth 2 x) :body (nth 3 x)
            (awhen (nth 5 x)
              (list :else (second it))))))
 
-;;; consume exactly one char that is NOT a brace
-;; (defrule non-brace-char
-;;     (and (not "{")
-;;          ;;(character-ranges (#\u0000 #\uffff))
-;;          ;;(! "{")
-;;          )
-;;   ;; (:when (lambda (ch)        ; but not braces
-;;   ;;          (and (char/= ch #\{)
-;;   ;;               (char/= ch #\}))))
-;;   (:lambda (chars)                      ; return a one-char string
-;;     (string (first chars))))
-
-(defrule pp/curly-braces-body
-  (and "{"
-       pp/statement-list
-       "}")
-  (:lambda (parts)
-    (let ((items (second parts))
-          (result ())
-          (buf (make-string-output-stream)))
-      (loop :for el :in items
-            :do
-            (etypecase el
-              (character
-               (write-char el buf))
-              (list
-               (let ((inert (get-output-stream-string buf)))
-                 (unless (zerop (length inert))
-                   (push inert result)))
-               (setf buf (make-string-output-stream))
-               (push el result))))
-      (push (get-output-stream-string buf) result)
-      (nreverse result))))
-
-;; (defrule pp/nested-block
-;;   (and "{"
-;;        (* (not "}"))
-;;        "}")
-;;   (:lambda (parts)
-;;     (list :nested-block (second parts))))
-
-(defrule pp/with-clause
-    (and "with" ws ":" ws ident opt-ws "=" opt-ws number opt-ws
-         pp/curly-braces-body)
-  (:lambda (x)
-    (list :with (nth 4 x)
-          :value (nth 8 x)
-          :body (nth 10 x))))
-
-(defrule pp/macro
-    (and "macro" ws ident opt-ws "(" (* (not ")")) ")" opt-ws
-         pp/curly-braces-body
-         )
-  (:lambda (x)
-    (break)
-    x))
-
-(defrule pp/everything-else
-    (+ (and opt-ws
-            (! pp/statement)
-            character))
-
-    ;; (+ (not (or "@"
-    ;;             "#"
-    ;;             "//"
-    ;;             "/*")))
-
-    ;; (and                                ;(! pp/statement)
-    ;;  (! "@")
-    ;;  character
-    ;;                                     ;(+ character)
-    ;;                                     ;(+ (not "@"))
-    ;;  )
-    (:lambda (x)
-      ;;(break)
-      (list :inert (third (first x)))))
+(defrule pp/inert-chunk
+    (+ (not (or "/*" "//" "#" "@" "$(")))
+  ;; (+ (! (or pp/statement
+  ;;           comment)))
+  (:lambda (chars)
+    (list :inert (coerce chars 'string))))
 
 (defrule pp/statement
     (and opt-ws
-         (! (or "}"
-                "@else"
-                "@endif"))
-         (or ;;pp/nested-block
-             pp/include-stmt
+         (or pp/include-stmt
              pp/define-stmt
              pp/ifdef-stmt
-             pp/with-clause
-             pp/macro
-             pp/variable-substitution
-             pp/everything-else
+             pp/substitution
+             pp/inert-chunk
              ))
   (:lambda (x)
-    (third x)))
+    (second x)))
 
 (defrule pp/statement-list
     (* (and opt-ws pp/statement))
@@ -178,7 +106,7 @@
 
 (defrule ident
   (and (or alpha "_")
-       (* (or alpha digit "_" "-")))
+       (* (or alpha digit (character-ranges #\_ #\-))))
   (:lambda (elements)
     (coerce (list* (first elements) (second elements)) 'string)))
 
@@ -355,9 +283,17 @@
     (preprocess-sleigh-file input)))
 
 (defun x4 ()
-  (let ((input "with : lockprefx=0 {
-:AAA			is vexMode=0 & bit64=0 & byte=0x37		{ local car = ((AL & 0xf) > 9) | AF; AL = (AL+6*car)&0xf; AH=AH+car; CF=car; AF=car; }
-}"))
+  (let ((input "@ifdef IA64
+:POPCNT Reg64, rm64      is $(LONGMODE_ON) & vexMode=0 & opsize=2 & $(PRE_F3) & $(REX_W) & byte=0x0F; byte=0xB8; Reg64 ... & rm64 { popcountflags(rm64); Reg64 = popcount(rm64); }
+@endif
+
+# The following
+#@ifdef IA64
+#:J^cc rel32     is
+#@endif
+
+postfix
+"))
     (preprocess-sleigh-file input)))
 
 (defun x5 ()
