@@ -37,12 +37,12 @@
 
 ;;;; Preprocessing
 
-(defrule pp/@include-stmt
+(defrule pp/include-stmt
   (and "@include" ws string opt-ws)
   (:lambda (x)
     (list :include (third x))))
 
-(defrule pp/@define-stmt
+(defrule pp/define-stmt
     (and "@define" ws ident ws string)
   (:lambda (x)
     (list :define :name (third x) :value (fifth x))))
@@ -50,76 +50,112 @@
 (defrule pp/variable-substitution
     (and "$(" ident ")")
   (:lambda (x)
-    (break "variable-substitution: ~S" x)
+    ;; TODO
     nil))
 
-(defrule pp/@ifdef-stmt
+(defrule pp/ifdef-stmt
   (and "@ifdef" ws ident
-       (* (and opt-ws pp/statement))
-       opt-ws (? (and "@else" (* (and opt-ws pp/statement))))
+       (* pp/statement)
+       opt-ws (? (and "@else" (* pp/statement)))
        opt-ws "@endif")
   (:lambda (x)
-    (break)
-    (list* :ifdef :condition (nth 2 x) :body (mapcar 'second (nth 3 x))
+    (list* :ifdef :condition (nth 2 x) :body (nth 3 x)
            (awhen (nth 5 x)
-             (list :else (mapcar 'second (second it)))))))
+             (list :else (second it))))))
 
 ;;; consume exactly one char that is NOT a brace
-(defrule non-brace-char
-  (and (not (or "{" "}"))                 ; lookahead: next char is not '{' or '}'
-       (character-ranges (#\u0000 #\uffff))) ; then consume one char
-  (:lambda (char)                          ; return a one-char string
-    (string char)))
+;; (defrule non-brace-char
+;;     (and (not "{")
+;;          ;;(character-ranges (#\u0000 #\uffff))
+;;          ;;(! "{")
+;;          )
+;;   ;; (:when (lambda (ch)        ; but not braces
+;;   ;;          (and (char/= ch #\{)
+;;   ;;               (char/= ch #\}))))
+;;   (:lambda (chars)                      ; return a one-char string
+;;     (string (first chars))))
 
-(defrule brace-block
+(defrule pp/curly-braces-body
   (and "{"
-       (* (or non-brace-char brace-block))
+       pp/statement-list
        "}")
   (:lambda (parts)
-    ;; parts => ("{" content-items* "}")
-    ;; we want to concatenate content-items (each either a string from non-brace-char
-    ;; or a string returned by a nested brace-block)
-    (let ((items (second parts)))
-      (apply #'concatenate 'string items))))
+    (let ((items (second parts))
+          (result ())
+          (buf (make-string-output-stream)))
+      (loop :for el :in items
+            :do
+            (etypecase el
+              (character
+               (write-char el buf))
+              (list
+               (let ((inert (get-output-stream-string buf)))
+                 (unless (zerop (length inert))
+                   (push inert result)))
+               (setf buf (make-string-output-stream))
+               (push el result))))
+      (push (get-output-stream-string buf) result)
+      (nreverse result))))
+
+;; (defrule pp/nested-block
+;;   (and "{"
+;;        (* (not "}"))
+;;        "}")
+;;   (:lambda (parts)
+;;     (list :nested-block (second parts))))
 
 (defrule pp/with-clause
     (and "with" ws ":" ws ident opt-ws "=" opt-ws number opt-ws
-         brace-block)
+         pp/curly-braces-body)
   (:lambda (x)
     (list :with (nth 4 x)
           :value (nth 8 x)
-          :body (first (nth 10 x)))))
+          :body (nth 10 x))))
 
-(defrule pp/directive-lookahead
-  (or "@include"
-      "@define"
-      "@ifdef"
-      "@else"
-      (and "with" ws)
-      "$("
-      ))
-
-(defrule pp/everything-else
-    (and (and (not pp/directive-lookahead)
-              (not "}")
-              )
-         (+ (character-ranges (#\u0000 #\uffff))))
+(defrule pp/macro
+    (and "macro" ws ident opt-ws "(" (* (not ")")) ")" opt-ws
+         pp/curly-braces-body
+         )
   (:lambda (x)
     (break)
-    (list :inert (coerce (mapcar #'second x) 'string))))
+    x))
+
+(defrule pp/everything-else
+    (+ (and opt-ws
+            (! pp/statement)
+            character))
+
+    ;; (+ (not (or "@"
+    ;;             "#"
+    ;;             "//"
+    ;;             "/*")))
+
+    ;; (and                                ;(! pp/statement)
+    ;;  (! "@")
+    ;;  character
+    ;;                                     ;(+ character)
+    ;;                                     ;(+ (not "@"))
+    ;;  )
+    (:lambda (x)
+      ;;(break)
+      (list :inert (third (first x)))))
 
 (defrule pp/statement
     (and opt-ws
-         (not "}")
-         (or pp/@include-stmt
-             pp/@define-stmt
-             pp/@ifdef-stmt
+         (! (or "}"
+                "@else"
+                "@endif"))
+         (or ;;pp/nested-block
+             pp/include-stmt
+             pp/define-stmt
+             pp/ifdef-stmt
              pp/with-clause
+             pp/macro
              pp/variable-substitution
              pp/everything-else
              ))
   (:lambda (x)
-    (second x)))
+    (third x)))
 
 (defrule pp/statement-list
     (* (and opt-ws pp/statement))
@@ -258,23 +294,26 @@
     *sleigh-context*))
 
 (defun preprocess-sleigh-file (file-name-or-string &key (base-directory (pathname-directory file-name-or-string)))
-  (%parse-sleigh-file
-   file-name-or-string
-   (lambda (input base-directory)
-     (mapcar (lambda (stmt)
-               (case (first stmt)
-                 (:include
-                  (let ((file-name (second stmt)))
-                    (preprocess-sleigh-file
-                     (make-pathname :directory base-directory
-                                    :defaults (pathname file-name))
-                     :base-directory base-directory)))
-                 (:with
-                  )))
-             (print (esrap:parse 'pp/sleigh-file input))))
-   :base-directory base-directory)
-
-  *sleigh-context*)
+  (let (ast)
+    (values
+     (%parse-sleigh-file
+      file-name-or-string
+      (lambda (input base-directory)
+        (setf ast (esrap:parse 'pp/sleigh-file input))
+        (format t "*** Parsed AST:~%~S~%" ast)
+        (mapcar (lambda (stmt)
+                  (case (first stmt)
+                    (:include
+                     (let ((file-name (second stmt)))
+                       (preprocess-sleigh-file
+                        (make-pathname :directory base-directory
+                                       :defaults (pathname file-name))
+                        :base-directory base-directory)))
+                    (:with
+                     )))
+                ast))
+      :base-directory base-directory)
+     ast)))
 
 (defun parse-sleigh-file (file-name-or-string
                           &key (base-directory (when (pathnamep file-name-or-string)
@@ -299,6 +338,12 @@
 ;; (parse-sleigh-file "/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/x86.slaspec")
 
 (defun x1 ()
+  (preprocess-sleigh-file #p"/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/x86.slaspec"))
+
+(defun x2 ()
+  (preprocess-sleigh-file #p"/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/ia.sinc"))
+
+(defun x3 ()
   (let ((input "@ifdef IA64
 @define SIZE     \"8\"
 @define STACKPTR \"RSP\"
@@ -307,13 +352,87 @@
 @define STACKPTR \"ESP\"
 @endif
 "))
-    (parse-sleigh-file input :base-directory nil)))
+    (preprocess-sleigh-file input)))
 
-(defun x2 ()
-  (preprocess-sleigh-file #p"/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/x86.slaspec"))
-
-(defun x3 ()
+(defun x4 ()
   (let ((input "with : lockprefx=0 {
 :AAA			is vexMode=0 & bit64=0 & byte=0x37		{ local car = ((AL & 0xf) > 9) | AF; AL = (AL+6*car)&0xf; AH=AH+car; CF=car; AF=car; }
 }"))
     (preprocess-sleigh-file input)))
+
+(defun x5 ()
+  (let ((input "prefix
+
+macro ptr4(r,x) {
+@ifdef IA64
+  r = zext(x);
+@else
+  r = x;
+@endif
+}
+
+postfix"))
+    (preprocess-sleigh-file input)))
+
+(defun test ()
+  (let ((tests
+          `(("
+
+some inert, non-comment stuff
+
+@ifdef IA64
+@define SIZE     \"8\"
+@else
+@define SIZE     \"4\"
+@endif
+"
+             ((:INERT "some inert, non-comment stuff
+
+")
+              (:IFDEF :CONDITION "IA64" :BODY ((:DEFINE :NAME "SIZE" :VALUE "8")) :ELSE
+                      ((:DEFINE :NAME "SIZE" :VALUE "4")))))
+            ("# SLA specification file for Intel x86
+@ifdef IA64
+@define SIZE     \"8\"
+@else
+@define SIZE     \"4\"
+@endif
+
+define endian=little;
+
+# General purpose registers
+
+@ifdef IA64
+define register...
+@else
+define register...
+@endif
+
+zork
+"
+             ((:IFDEF :CONDITION "IA64"
+                      :BODY ((:DEFINE :NAME "SIZE" :VALUE "8"))
+                      :ELSE ((:DEFINE :NAME "SIZE" :VALUE "4")))
+              (:INERT "define endian=little;
+
+")
+              (:IFDEF :CONDITION "IA64" :BODY
+                      ((:INERT "define register...
+"))
+                      :ELSE
+                      ((:INERT "define register...
+")))
+              (:INERT "zork
+"))))))
+    (mapcar (lambda (el)
+              (destructuring-bind (input expected) el
+                (multiple-value-bind (context ast)
+                    (preprocess-sleigh-file input)
+                  (declare (ignore context))
+                  (if (equal ast expected)
+                      t
+                      (progn
+                        (break "Test failed: ~S~%*** result:~%~S~%*** expected:~%~S"
+                               input ast expected)
+                        input)))))
+            tests)))
