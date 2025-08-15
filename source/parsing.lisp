@@ -2,16 +2,16 @@
 
 ;; ghidra/Ghidra/Framework/SoftwareModeling/src/main/antlr/ghidra/sleigh/grammar/
 
-(defvar *sleigh-context*)
+(defvar *context*)
 
 #+nil
 (hu.dwim.defclass-star:defclass* sleigh-context ()
-  ((preprocessor-definitions (make-hash-table :test 'equal))))
+  ((definitions (make-hash-table :test 'equal))))
 
-(defclass sleigh-context nil
-  ((preprocessor-definitions :initform (make-hash-table :test 'equal)
-                             :accessor preprocessor-definitions-of :initarg
-                             :preprocessor-definitions)))
+(defclass context nil
+  ((definitions :initform (make-hash-table :test 'equal)
+                :accessor definitions-of :initarg
+                :definitions)))
 
 ;;;; Whitespace & comments
 
@@ -34,67 +34,6 @@
    (and "#"  (* (not (or #\Newline #\Return))) (+ (or #\Newline #\Return)))
    (and "/*" (* (not "*/")) "*/"))
   (:constant nil))
-
-;;;; Preprocessing
-
-(defrule pp/include-stmt
-  (and "@include" ws string opt-ws)
-  (:lambda (x)
-    (list :include (third x))))
-
-(defrule pp/define-stmt
-    (and "@define" ws ident ws string)
-  (:lambda (x)
-    (list :define :name (third x) :value (fifth x))))
-
-(defrule pp/substitution
-    (and "$(" ident ")")
-  (:lambda (x)
-    (list :substitution (second x))))
-
-(defrule pp/ifdef-stmt
-  (and (or "@ifdef"
-           "@ifndef")
-       ws ident
-       (* pp/statement)
-       opt-ws (? (and "@else" (* pp/statement)))
-       opt-ws "@endif")
-  (:lambda (x)
-    (list* (eswitch ((first x) :test 'equal)
-             ("@ifdef"  :ifdef)
-             ("@ifndef" :ifndef))
-           :condition (nth 2 x) :body (nth 3 x)
-           (awhen (nth 5 x)
-             (list :else (second it))))))
-
-(defrule pp/inert-chunk
-    (+ (not (or "/*" "//" "#" "@" "$(")))
-  ;; (+ (! (or pp/statement
-  ;;           comment)))
-  (:lambda (chars)
-    (list :inert (coerce chars 'string))))
-
-(defrule pp/statement
-    (and opt-ws
-         (or pp/include-stmt
-             pp/define-stmt
-             pp/ifdef-stmt
-             pp/substitution
-             pp/inert-chunk
-             ))
-  (:lambda (x)
-    (second x)))
-
-(defrule pp/statement-list
-    (* (and opt-ws pp/statement))
-  (:lambda (x)
-    (mapcar 'second x)))
-
-(defrule pp/sleigh-file
-    (and pp/statement-list
-         opt-ws)
-  (:lambda (x)
-    (first x)))
 
 ;;;; Lexical rules
 
@@ -126,31 +65,44 @@
 (defrule pattern-expr
   (or ident number string))
 
-;;;; Statements
+;;;; Define statements
 
-(defrule define-stmt
+(defrule define-token-stmt
+  (and "define token" ws ident ws "(" number ")" (* (not ";")) ";")
+  (:lambda (x)
+    (list :define-token (nth 2 x) (nth 5 x) (nth 7 x))))
+
+(defrule define-space-stmt
+  (and "define space" ws ident ws  "type=" ident ws "size=" number opt-ws (? "default") opt-ws ";")
+  (:lambda (x)
+    (list :define-space (nth 2 x) (nth 4 x) (nth 7 x) (nth 9 x))))
+
+(defrule define-register-stmt
+  (and "define register" ws ident ws  "offset=" ident ws "size=" number opt-ws ";")
+  (:lambda (x)
+    (list :define-register (nth 2 x) (nth 4 x) (nth 7 x))))
+
+(defrule define-value-stmt
   (and "define" ws ident "=" value opt-ws ";")
   (:lambda (x) (list :define (nth 2 x) (nth 4 x))))
 
-(defrule define-space-stmt
-  (and "define" ws "space" ws ident ws  "type=" ident ws "size=" value opt-ws ";")
-  (:lambda (x) (list :define (nth 2 x) (nth 4 x))))
+;;;; Other statements
 
 (defrule token-stmt
-  (and "token" ws ident opt-ws "{" opt-ws (* field-decl) opt-ws "}")
+    (and "token" ws ident opt-ws "{" opt-ws (* field-decl) opt-ws "}")
   (:lambda (x) (list :token (nth 2 x) (nth 6 x))))
 
 (defrule field-decl
   (and ident opt-ws "=" opt-ws number opt-ws ":" opt-ws number opt-ws)
   (:lambda (x) (list :field (first x) :lo (nth 4 x) :hi (nth 8 x))))
 
-(defrule space-stmt
-  (and "space" ws ident ws number opt-ws)
-  (:lambda (x) (list :space (nth 2 x) (nth 4 x))))
+;; (defrule space-stmt
+;;   (and "space" ws ident ws number opt-ws)
+;;   (:lambda (x) (list :space (nth 2 x) (nth 4 x))))
 
-(defrule register-stmt
-  (and "register" ws ident opt-ws "{" opt-ws (* reg-def) opt-ws "}")
-  (:lambda (x) (list :register (nth 2 x) (nth 6 x))))
+;; (defrule register-stmt
+;;   (and "register" ws ident opt-ws "{" opt-ws (* reg-def) opt-ws "}")
+;;   (:lambda (x) (list :register (nth 2 x) (nth 6 x))))
 
 (defrule reg-def
   (and ident opt-ws "=" opt-ws number opt-ws)
@@ -191,10 +143,13 @@
 
 (defrule statement
     (and opt-ws
-         (or define-stmt
-             token-stmt
-             space-stmt
-             register-stmt
+         (or define-token-stmt
+             define-space-stmt
+             define-register-stmt
+             define-stmt
+             ;;token-stmt
+             ;;space-stmt
+             ;;register-stmt
              attach-stmt
              macro-stmt
              constructor-stmt)
@@ -211,65 +166,36 @@
   (:lambda (x)
     (first x)))
 
-(defun %parse-sleigh-file (file-name-or-string body-fn &key (base-directory (pathname-directory file-name-or-string)))
-  (let ((*sleigh-context* (if (boundp '*sleigh-context*)
-                              *sleigh-context*
-                              (make-instance 'sleigh-context)))
-        (input (if (pathnamep file-name-or-string)
-                   (uiop:read-file-string file-name-or-string)
-                   file-name-or-string)))
-    (funcall body-fn input base-directory)
-    *sleigh-context*))
-
-(defun preprocess-sleigh-file (file-name-or-string &key (base-directory (pathname-directory file-name-or-string)))
-  (let (ast)
-    (values
-     (%parse-sleigh-file
-      file-name-or-string
-      (lambda (input base-directory)
-        (setf ast (esrap:parse 'pp/sleigh-file input))
-        (format t "*** Parsed AST:~%~S~%" ast)
-        (mapcar (lambda (stmt)
-                  (case (first stmt)
-                    (:include
-                     (let ((file-name (second stmt)))
-                       (preprocess-sleigh-file
-                        (make-pathname :directory base-directory
-                                       :defaults (pathname file-name))
-                        :base-directory base-directory)))
-                    (:with
-                     )))
-                ast))
-      :base-directory base-directory)
-     ast)))
+;; (defun %parse-sleigh-file (file-name-or-string body-fn &key (base-directory (pathname-directory file-name-or-string)))
+;;   (let ((*context* (if (boundp '*context*)
+;;                        *context*
+;;                        (make-instance 'context)))
+;;         (input (if (pathnamep file-name-or-string)
+;;                    (uiop:read-file-string file-name-or-string)
+;;                    file-name-or-string)))
+;;     (setf input (hu.dwim.sleigh.preprocessing:preprocess-sleigh-file input :base-directory base-directory))
+;;     (funcall body-fn input base-directory)
+;;     *context*))
 
 (defun parse-sleigh-file (file-name-or-string
                           &key (base-directory (when (pathnamep file-name-or-string)
                                                  (pathname-directory file-name-or-string))))
-  (%parse-sleigh-file
-   file-name-or-string
-   (lambda (input base-directory)
-     (mapcar (lambda (stmt)
-               (case (first stmt)
-                 (:include
-                  (let ((file-name (second stmt)))
-                    (parse-sleigh-file
-                     (make-pathname :directory base-directory
-                                    :defaults (pathname file-name)))))
-                 (:with
-                  )))
-             (print (esrap:parse 'sleigh-file input))))
-   :base-directory base-directory)
+  (let* ((*context* (if (boundp '*context*)
+                        *context*
+                      (make-instance 'context)))
+         (input (if (pathnamep file-name-or-string)
+                    (uiop:read-file-string file-name-or-string)
+                  file-name-or-string))
+         (preprocessed (hu.dwim.sleigh.preprocessing:preprocess-sleigh-file input :base-directory base-directory))
+         (parsed (esrap:parse 'sleigh-file preprocessed)))
+    (mapcar (lambda (stmt)
+              (ecase (first stmt)
+                (:with
+                 )))
+            parsed)))
 
-  *sleigh-context*)
-
-;; (parse-sleigh-file "/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/x86.slaspec")
-
-(defun x1 ()
-  (preprocess-sleigh-file #p"/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/x86.slaspec"))
-
-(defun x2 ()
-  (preprocess-sleigh-file #p"/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/ia.sinc"))
+;; (parse-sleigh-file #p"/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/x86.slaspec")
+;; (parse-sleigh-file #p"/home/alendvai/common-lisp/maru/playground/ghidra/Ghidra/Processors/x86/data/languages/ia.sinc")
 
 (defun x3 ()
   (let ((input "@ifdef IA64
@@ -280,7 +206,7 @@
 @define STACKPTR \"ESP\"
 @endif
 "))
-    (preprocess-sleigh-file input)))
+    (parse-sleigh-file input)))
 
 (defun x4 ()
   (let ((input "@ifdef IA64
@@ -294,7 +220,7 @@
 
 postfix
 "))
-    (preprocess-sleigh-file input)))
+    (parse-sleigh-file input)))
 
 (defun x5 ()
   (let ((input "prefix
@@ -308,7 +234,7 @@ macro ptr4(r,x) {
 }
 
 postfix"))
-    (preprocess-sleigh-file input)))
+    (parse-sleigh-file input)))
 
 (defun test ()
   (let ((tests
@@ -363,7 +289,7 @@ zork
     (mapcar (lambda (el)
               (destructuring-bind (input expected) el
                 (multiple-value-bind (context ast)
-                    (preprocess-sleigh-file input)
+                    (parse-sleigh-file input)
                   (declare (ignore context))
                   (if (equal ast expected)
                       t
